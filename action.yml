@@ -1,0 +1,15 @@
+#action.yml
+name: Checkbuild
+
+description: 'Run buildpatch with patches'
+
+inputs:
+  github_token:
+    description: Secret github github_token
+    required: true
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  env:
+    GITHUB_TOKEN: ${{ inputs.github_token }}

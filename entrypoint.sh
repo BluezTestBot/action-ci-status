@@ -19,4 +19,8 @@ then
 	exit 1
 fi
 
-/checkbuild.sh
+# Get PR number from GITHUB_REF (refs/pull/#/merge)
+PR=${GITHUB_REF#"refs/pull/"}
+PR=${PR%"/merge"}
+
+/checkbuild.py -p $PR -r $GITHUB_REPOSITORY -v

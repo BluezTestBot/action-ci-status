@@ -4,12 +4,16 @@ name: CI Status
 description: 'Action for checking the CI status and notifying it to the maintainer'
 
 inputs:
+  github_token:
+    description: Github token
+    required: true
   email_token:
-    description: Email secret
+    description: Email token
     required: true
 
 runs:
   using: 'docker'
   image: 'Dockerfile'
   env:
+    GITHUB_TOKEN: ${{ inputs.github_token }}
     EMAIL_TOKEN: ${{ inputs.email_token }}

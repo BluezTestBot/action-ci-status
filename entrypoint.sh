@@ -18,4 +18,5 @@ if [ -z "$GITHUB_TOKEN" ]; then
 	exit 1
 fi
 
-/ci-status.py
+
+/ci-status.py -v -b /workdir -c /config.ini 

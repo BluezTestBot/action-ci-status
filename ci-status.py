@@ -1,150 +1,98 @@
 #!/usr/bin/env python3
-import os
-import sys
-import logging
 import argparse
-import subprocess
-import re
-import smtplib
-import email.utils
-import requests
 import configparser
-from github import Github
+import datetime
+import email.utils
+import git
+import logging
+import os
+import pathlib
+import smtplib
+import shutil
+from abc import ABCMeta, abstractmethod
 from email.mime.multipart import MIMEMultipart
+from github import Github
 from email.mime.text import MIMEText
 
 logger = None
+CONFIG = None
+BASE_DIR = None
 
-github_repo = None
-github_pr = None
-patchwork_sid = None
+GITHUB_REPO_LIST = [
+    "bluez/bluez",
+    "bluez/bluetooth-next",
+    "blueztestbot/bluez",
+    "blueztestbot/bluetooth-next"
+]
 
-config = None
+REPO_SYNC_MAP = [
+    {
+        "name" : "upstream_bluez_master",
+        "src_repo" : "https://git.kernel.org/pub/scm/bluetooth/bluez.git",
+        "src_branch" : "master",
+        "dest_repo" : "https://github.com/bluez/bluez",
+        "dest_branch" : "master"
+    },
+    {
+        "name" : "upstream_bluetooth-next_master",
+        "src_repo" : "https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git",
+        "src_branch" : "master",
+        "dest_repo" : "https://github.com/bluez/bluetooth-next",
+        "dest_branch" : "master"
+    },
+    {
+        "name" : "upstream_bluetooth-next_for-upstream",
+        "src_repo" : "https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git",
+        "src_branch" : "for-upstream",
+        "dest_repo" : "https://github.com/bluez/bluetooth-next",
+        "dest_branch" : "for-upstream"
+    },
+    {
+        "name" : "testbot_bluez_master",
+        "src_repo" : "https://github.com/bluez/bluez",
+        "src_branch" : "master",
+        "dest_repo" : "https://github.com/BluezTestBot/bluez",
+        "dest_branch" : "master"
+    },
+    {
+        "name" : "testbot_bluetooth-next_master",
+        "src_repo" : "https://github.com/bluez/bluetooth-next",
+        "src_branch" : "master",
+        "dest_repo" : "https://github.com/BluezTestBot/bluetooth-next",
+        "dest_branch" : "master"
+    },
+    {
+        "name" : "testbot_bluetooth-next_for-upstream",
+        "src_repo" : "https://github.com/bluez/bluetooth-next",
+        "src_branch" : "for-upstream",
+        "dest_repo" : "https://github.com/BluezTestBot/bluetooth-next",
+        "dest_branch" : "for-upstream"
+    },
+]
 
-PATCHWORK_BASE_URL = "https://patchwork.kernel.org/api/1.1"
+HEADER = '''
+Hi team,
 
-FAIL_MSG = '''
-This is automated email and please do not reply to this email!
+This email contains the status of the BlueZ and CI repositories in Github to
+provide the synchronization status with the upstream repo and issue/PR counts.
 
-Dear submitter,
+'''
 
-Thank you for submitting the patches to the linux bluetooth mailing list.
-While we are preparing for reviewing the patches, we found the following
-issue/warning.
+FOOTER = '''
 
-
-Test Result:
-Checkbuild Failed
-
-Patch Series:
-{}
-
-Outputs:
-{}
-
+PS: This is automated email and please do not reply to this email!
 
 ---
 Regards,
 Linux Bluetooth
 '''
 
-def requests_url(url):
-    """ Helper function to requests WEB API GET with URL """
-
-    resp = requests.get(url)
-    if resp.status_code != 200:
-        raise requests.HTTPError("GET {}".format(resp.status_code))
-
-    return resp
-
-def patchwork_get_series(sid):
-    """ Get series detail from patchwork """
-
-    url = PATCHWORK_BASE_URL + "/series/" + sid
-    req = requests_url(url)
-
-    return req.json()
-
-def get_pw_sid(pr_title):
-    """
-    Parse PR title prefix and get PatchWork Series ID
-    PR Title Prefix = "[PW_S_ID:<series_id>] XXXXX"
-    """
-
-    try:
-        sid = re.search(r'^\[PW_SID:([0-9]+)\]', pr_title).group(1)
-    except AttributeError:
-        logging.error("Unable to find the series_id from title %s" % pr_title)
-        sid = None
-
-    return sid
-
-def github_post_comment(msg):
-    """ Post message to PR comment """
-
-    # TODO: If the comment alrady exist, edit instead of create new one
-
-    github_pr.create_issue_comment(msg)
-
-def checkbuild_success_msg(extra_msg=None):
-    """ Generate success message """
-
-    msg = "**Checkbuild: PASS**\n\n"
-    if extra_msg != None:
-        msg += extra_msg
-
-    return msg
-
-def checkbuild_fail_msg(output):
-    """ Generate fail message with output """
-
-    msg = "**Checkbuild: FAIL**\n\n"
-    msg = "Output:\n"
-    msg += "```\n"
-    msg += output
-    msg += "```\n"
-
-    return msg
-
-def run_cmd(*args, cwd=None):
-    """ Run command and return return code, stdout and stderr """
-
-    cmd = []
-    cmd.extend(args)
-    cmd_str = "{}".format(" ".join(str(w) for w in cmd))
-    logging.info("CMD: %s" % cmd_str)
-
-    stdout = ""
-    try:
-        proc = subprocess.Popen(cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                bufsize=1,
-                                universal_newlines=True,
-                                cwd=cwd)
-    except OSError as e:
-        logging.error("ERROR: failed to run cmd: %s" % e)
-        return (-1, None, None)
-
-    for line in proc.stdout:
-        logging.debug(line.rstrip('\n'))
-        stdout += line
-
-    # stdout is consumed in previous line. so, communicate() returns empty
-    _ignore, stderr = proc.communicate()
-
-    logging.debug(">> STDERR")
-    logging.debug("/n{}".format(stderr))
-
-    return (proc.returncode, stdout, stderr)
-
 def send_email(sender, receiver, msg):
     """ Send email """
 
-    email_cfg = config['email']
-
+    email_cfg = CONFIG['email']
     if 'EMAIL_TOKEN' not in os.environ:
-        logging.warning("missing EMAIL_TOKEN. Skip sending email")
+        logger.warning("missing EMAIL_TOKEN. Skip sending email")
         return
 
     try:
@@ -155,25 +103,18 @@ def send_email(sender, receiver, msg):
         session.ehlo()
         session.login(sender, os.environ['EMAIL_TOKEN'])
         session.sendmail(sender, receiver, msg.as_string())
-        logging.info("Successfully sent email")
+        logger.info("Successfully sent email")
     except Exception as e:
-        logging.error("Exception: {}".format(e))
+        logger.error("Exception: {}".format(e))
     finally:
         session.quit()
+    logger.info("Sending email done")
 
-    logging.info("Sending email done")
+def compose_and_send(messages):
+    """ Compose the email and send to the mailing list """
 
-def notify_failure(stdout, stderr):
-    """ Send failure to mailing list """
-
-    email_cfg = config['email']
-
-    # sender = 'bluez.test.bot@gmail.com'
+    email_cfg = CONFIG['email']
     sender = email_cfg['user']
-
-    # Get series detail from Patchwork with github PR
-    series = patchwork_get_series(patchwork_sid)
-    logging.debug("Got Patchwork Series: {}".format(series))
 
     receivers = []
     if 'only-maintainers' in email_cfg and email_cfg['only-maintainers'] == 'yes':
@@ -183,117 +124,303 @@ def notify_failure(stdout, stderr):
     else:
         # Send to default-to address and submitter
         receivers.append(email_cfg['default-to'])
-        receivers.append(series['submitter']['email'])
 
-    patches = series['patches']
-    patch_1 = patches[0]
-    patch_list = ""
-    for patch in patches:
-        patch_list += patch['name'] + "\n"
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
 
     # Create message
     msg = MIMEMultipart()
     msg['From'] = sender
     msg['To'] = ", ".join(receivers)
-    msg['Subject'] = "RE: " + series['name']
+    msg['Subject'] = "[Intel - internal] BlueZ Repository Status - %s" % today
 
-    # Message Header
-    msg.add_header('In-Reply-To', patch_1['msgid'])
-    msg.add_header('References', patch_1['msgid'])
+    body = HEADER + '\n'
+    body += messages + '\n'
+    body += FOOTER
 
-    body = FAIL_MSG.format(patch_list, stderr)
-    logging.debug("Message Body: %s" % body)
     msg.attach(MIMEText(body, 'plain'))
-
-    logging.debug("Mail Message: {}".format(msg))
+    logger.debug("Mail Message: \n{}".format(msg))
 
     # Send email
     send_email(sender, receivers, msg)
 
-def process_failure(stdout, stderr):
+def git_clone_repo(repo, to_path, branch='master', depth=1, delete_exist=True):
+    """ Clone repo with gitpython API and return repo object """
+
+    # Check input parameter
+    if os.path.exists(to_path):
+        if delete_exist:
+            shutil.rmtree(to_path)
+            logger.info("Repo to_path is already exist and removed")
+        else:
+            logger.error("Repo to_path is already exist")
+            return None
+
+    return git.Repo.clone_from(repo, to_path, branch=branch, depth=depth)
+
+def github_init(repo):
+    """ Initialize github object """
+
+    return Github(os.environ['GITHUB_TOKEN']).get_repo(repo)
+
+def github_get_issues_only(repo, state='open'):
+    """ Get a list of issues from the repo """
+
+    issues_only = []
+    all_issues = repo.get_issues(state=state)
+    for issue in all_issues:
+        if not issue.pull_request:
+            issues_only.append(issue)
+
+    return issues_only
+
+
+class StatusBase(metaclass=ABCMeta):
+    """ Base class for Status task """
+
+    result = None
+
+    def add_result(self, result):
+        if not self.result:
+            self.result = result
+        else:
+            self.result += '\n' + result
+
+    def get_result(self):
+        return self.result
+
+    @abstractmethod
+    def check(self):
+        raise NotImplementedError
+
+
+class RepoSyncStatus(StatusBase):
     """
-    When the check fails, it post the message to github PR and sent email to
-    the mailing list (if enabled in config)
+    Repo Sync status: Clone two repos (src_repo and dest_repo) and compare
+    the top commits and update the message with the result.
     """
 
-    logging.debug("Post fail message to PR")
-    github_post_comment(checkbuild_fail_msg(stderr))
+    def __init__(self, name, src_repo, src_branch, dest_repo, dest_branch):
+        self.name = name
+        self.src_repo = src_repo
+        self.dest_repo = dest_repo
+        self.src_branch = src_branch
+        self.dest_branch = dest_branch
+        self.base_dir = os.path.join(BASE_DIR, name)
 
-    # Send email to mailing list
-    if 'enable' not in config['email'] or config['email']['enable'] == 'yes':
-        notify_failure(stdout, stderr)
+        # Add information to the result string
+        self.add_result("Repo Sync: %s" % self.name)
 
-def process_success(stdout, stderr):
+    def check(self):
+        logger.debug("Check Repo Sync Status")
+
+        # Clone src repo + branch
+        logger.debug("1. Clone src_repo: {}({})".format(self.src_repo,
+                                                        self.src_branch))
+        repo_src = git_clone_repo(self.src_repo, self.base_dir + "_src", self.src_branch)
+        if not repo_src:
+            logger.error("Unable to clone repo: %s" % self.src_repo)
+            self.add_result("   Results: Failed (Clone src repo failed)")
+            return -1
+
+        # Clone dest repo + branch
+        logger.debug("2. Clone dest_repo: {}({})".format(self.dest_repo,
+                                                         self.dest_branch))
+        repo_dest = git_clone_repo(self.dest_repo, self.base_dir + "_dest",
+                                   self.dest_branch)
+        if not repo_dest:
+            logger.error("Unable to clone repo: %s" % self.dest_repo)
+            self.add_result("   Results: Fail (Clone dest repo failed)")
+            return -1
+
+        # Compare HEAD
+        logger.debug("3. Compare HEADs of both repos")
+        src_head_sha = repo_src.head.commit.hexsha
+        dest_head_sha = repo_dest.head.commit.hexsha
+
+        logger.debug("src head:  %s" % src_head_sha)
+        logger.debug("dest head: %s" % dest_head_sha)
+        self.add_result("   SRC HEAD:  %s" % src_head_sha)
+        self.add_result("   DEST HEAD: %s" % dest_head_sha)
+        if src_head_sha != dest_head_sha:
+            logger.info("src repo and dest repo are not synced")
+            self.add_result("   Result: Fail (SHA mismatch)")
+            return -1
+
+        logger.info("src repo and dest repo are synced")
+        self.add_result("   Result: Pass")
+        return 0
+
+
+class GithubRepoStatus(StatusBase):
     """
-    When the check success, it simply post the message to github PR.
-    No need to send email to the mailing list
+    Github Repo status
     """
 
-    logging.debug("Post success message to PR")
-    github_post_comment(checkbuild_success_msg())
+    def __init__(self, repo):
+        self.repo = repo
+
+        # Add information to the result string
+        self.add_result("Github Repo: %s" % self.repo)
+
+    def check(self):
+        logger.debug("Check Repo Status and Information")
+
+        logger.debug("1. Initialize the github repo(%s)" % self.repo)
+        github_repo = github_init(self.repo)
+        if not github_repo:
+            logger.error("Failed to initialized the repo: %s" % self.repo)
+            self.add_result("   Result: Fail (Failed to init github repo)")
+            return -1
+
+        # Get the number of PR
+        logger.debug("2. Get the number of open Pull Requests")
+        repo_prs = github_repo.get_pulls(state='open')
+        logger.debug("   PRs:    %d" % repo_prs.totalCount)
+        self.add_result("   PRs:    %d" % repo_prs.totalCount)
+
+        # Get the number of Issues
+        logger.debug("3. Get the number of open issues")
+        repo_issues = github_get_issues_only(github_repo)
+        logger.debug("   Issues: %d" % len(repo_issues))
+        self.add_result("   Issues: %d" % len(repo_issues))
+
+        return 0
+
+def compare_repo_branch(src_repo, dest_repo, src_branch='master', dest_branch='master'):
+
+    logger.debug("Create RepoSyncStatus objec")
+    repo_sync = RepoSyncStatus("test", src_repo, dest_repo, src_branch, dest_branch)
+
+    logger.debug("calling check")
+    repo_sync.check()
+
+    print("obj message: " + repo_sync.result)
+
+
+def check_repo_sync(sync_list):
+    """ Run repo sync status """
+
+    for index, item in enumerate(REPO_SYNC_MAP):
+        logger.debug("### Repo Sync Map#%d ###" % (index + 1))
+        logger.debug("   name:        " + item['name'])
+        logger.debug("   src_repo:    " + item['src_repo'])
+        logger.debug("   src_branch:  " + item['src_branch'])
+        logger.debug("   dest_repo:   " + item['dest_repo'])
+        logger.debug("   dest_branch: " + item['dest_branch'])
+
+        repo_sync = RepoSyncStatus(item['name'],
+                                   item['src_repo'],
+                                   item['src_branch'],
+                                   item['dest_repo'],
+                                   item['dest_branch'])
+        repo_sync.check()
+        sync_list.append(repo_sync)
+
+def check_repo_status(check_list):
+    """ Run repo PR status """
+
+    for index, repo_name in enumerate(GITHUB_REPO_LIST):
+        logger.debug("### Github Repo Status#%d ###" % (index + 1))
+        logger.debug("   repo: %s" % repo_name)
+
+        # Create Github Repo Status object
+        check_repo = GithubRepoStatus(repo_name)
+        check_repo.check()
+        check_list.append(check_repo)
+
+def collect_results(task_list):
+    """ Collect the list from the check task and return the string """
+    results = ""
+
+    for task in task_list:
+        results = results + '\n' + task.get_result()
+    return results
 
 def ci_status(args):
-    """ Check CI status """
-    
-    # TBD
-    pass
+    """ Run CI Status """
 
+    sync_list = []
+    check_list = []
+    messages = ""
+
+    # Check repo sync
+    check_repo_sync(sync_list)
+    # Check repo PR status
+    check_repo_status(check_list)
+
+    # Collect all results
+    messages += "##### Repository Synchronization Status #####\n"
+    messages += collect_results(sync_list)
+    messages += "\n\n"
+    messages += "##### Github Repository Status/Information #####\n"
+    messages += collect_results(check_list)
+
+    logger.debug("Email Messages: \n**********\n%s\n**********\n" % messages)
+
+    # Compose email and send
+    compose_and_send(messages)
 
 def init_logging(verbose):
     """ Initialize logger. Default to INFO """
 
     global logger
 
-    logger = logging.getLogger('')
-    ch = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s:%(levelname)-8s:%(message)s')
-    ch.setFormatter(formatter)
-
-    logger.addHandler(ch)
+    logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
     if verbose:
         logger.setLevel(logging.DEBUG)
 
-    logging.info("Initialized the logger: level=%s",
+    ch = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s: %(levelname)-8s: %(message)s')
+    ch.setFormatter(formatter)
+
+    logger.addHandler(ch)
+
+    logger.info("Initialized the logger: level=%s",
                  logging.getLevelName(logger.getEffectiveLevel()))
 
-def init_config():
-    """ Read config.ini """
+def init(args):
+    """ Initialization """
 
-    global config
+    global BASE_DIR
+    global CONFIG
 
-    config = configparser.ConfigParser()
-    config.read("/config.ini")
+    # Base dir
+    if not os.path.exists(args.base_dir):
+        os.mkdir(args.base_dir)
+    BASE_DIR = args.base_dir
 
-def init_github(args):
-    """ Initialize github object """
+    # logging
+    init_logging(args.verbose)
 
-    global github_repo
-    global github_pr
-    global patchwork_sid
+    # parse configuration
+    if not os.path.exists(args.config):
+        logger.error("Cannot find the configuration file: %s" % args.config)
+        return -1
 
-    github_repo = Github(os.environ['GITHUB_TOKEN']).get_repo(args.repo)
-    github_pr = github_repo.get_pull(args.pull_request)
-    patchwork_sid = get_pw_sid(github_pr.title)
+    CONFIG = configparser.ConfigParser()
+    CONFIG.read(args.config)
+
+    logger.info("Initialization completed")
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Check build with commits in pull request")
 
+    parser = argparse.ArgumentParser(description="Check the various CI status")
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Display debugging info')
+    parser.add_argument('-b', '--base-dir', required=False,
+                        default=os.getcwd(), type=pathlib.Path,
+                        help='Base directory of repos')
+    parser.add_argument('-c', '--config', required=False,
+                        default='./config.ini', type=pathlib.Path,
+                        help='Path to the configuration file')
 
     return parser.parse_args()
 
 def main():
+
     args = parse_args()
-
-    init_logging(args.verbose)
-
-    init_config()
-
-    init_github(args)
-
+    init(args)
     ci_status(args)
 
 if __name__ == "__main__":

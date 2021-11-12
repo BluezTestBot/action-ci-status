@@ -10,6 +10,7 @@ import pathlib
 import smtplib
 import shutil
 from abc import ABCMeta, abstractmethod
+from enum import Enum
 from email.mime.multipart import MIMEMultipart
 from github import Github
 from email.mime.text import MIMEText
@@ -27,42 +28,42 @@ GITHUB_REPO_LIST = [
 
 REPO_SYNC_MAP = [
     {
-        "name" : "upstream_bluez_master",
+        "name" : "bluez",
         "src_repo" : "https://git.kernel.org/pub/scm/bluetooth/bluez.git",
         "src_branch" : "master",
         "dest_repo" : "https://github.com/bluez/bluez",
         "dest_branch" : "master"
     },
     {
-        "name" : "upstream_bluetooth-next_master",
+        "name" : "bluetooth-next",
         "src_repo" : "https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git",
         "src_branch" : "master",
         "dest_repo" : "https://github.com/bluez/bluetooth-next",
         "dest_branch" : "master"
     },
     {
-        "name" : "upstream_bluetooth-next_for-upstream",
+        "name" : "bluetooth-next:for-upstream",
         "src_repo" : "https://git.kernel.org/pub/scm/linux/kernel/git/bluetooth/bluetooth-next.git",
         "src_branch" : "for-upstream",
         "dest_repo" : "https://github.com/bluez/bluetooth-next",
         "dest_branch" : "for-upstream"
     },
     {
-        "name" : "testbot_bluez_master",
+        "name" : "BluezTestBot:bluez",
         "src_repo" : "https://github.com/bluez/bluez",
         "src_branch" : "master",
         "dest_repo" : "https://github.com/BluezTestBot/bluez",
         "dest_branch" : "master"
     },
     {
-        "name" : "testbot_bluetooth-next_master",
+        "name" : "BluezTestBot:bluetooth-next",
         "src_repo" : "https://github.com/bluez/bluetooth-next",
         "src_branch" : "master",
         "dest_repo" : "https://github.com/BluezTestBot/bluetooth-next",
         "dest_branch" : "master"
     },
     {
-        "name" : "testbot_bluetooth-next_for-upstream",
+        "name" : "BluezTestBot:bluetooth-next:for-upstream",
         "src_repo" : "https://github.com/bluez/bluetooth-next",
         "src_branch" : "for-upstream",
         "dest_repo" : "https://github.com/BluezTestBot/bluetooth-next",
@@ -173,11 +174,19 @@ def github_get_issues_only(repo, state='open'):
 
     return issues_only
 
+class Verdict(Enum):
+    PENDING = 0
+    PASS = 1
+    FAIL = 2
+    ERROR = 3
+    SKIP = 4
+    WARNING = 5
 
 class StatusBase(metaclass=ABCMeta):
     """ Base class for Status task """
 
     result = None
+    verdict = None
 
     def add_result(self, result):
         if not self.result:
@@ -210,6 +219,9 @@ class RepoSyncStatus(StatusBase):
         # Add information to the result string
         self.add_result("Repo Sync: %s" % self.name)
 
+        # Just to print out the result
+        self.verdict = Verdict.PASS
+
     def check(self):
         logger.debug("Check Repo Sync Status")
 
@@ -220,6 +232,7 @@ class RepoSyncStatus(StatusBase):
         if not repo_src:
             logger.error("Unable to clone repo: %s" % self.src_repo)
             self.add_result("   Results: Failed (Clone src repo failed)")
+            self.verdict = Verdict.ERROR
             return -1
 
         # Clone dest repo + branch
@@ -230,6 +243,7 @@ class RepoSyncStatus(StatusBase):
         if not repo_dest:
             logger.error("Unable to clone repo: %s" % self.dest_repo)
             self.add_result("   Results: Fail (Clone dest repo failed)")
+            self.verdict = Verdict.ERROR
             return -1
 
         # Compare HEAD
@@ -244,6 +258,7 @@ class RepoSyncStatus(StatusBase):
         if src_head_sha != dest_head_sha:
             logger.info("src repo and dest repo are not synced")
             self.add_result("   Result: Fail (SHA mismatch)")
+            self.verdict = Verdict.FAIL
             return -1
 
         logger.info("src repo and dest repo are synced")
@@ -261,6 +276,7 @@ class GithubRepoStatus(StatusBase):
 
         # Add information to the result string
         self.add_result("Github Repo: %s" % self.repo)
+        self.verdict = Verdict.WARNING
 
     def check(self):
         logger.debug("Check Repo Status and Information")
@@ -270,6 +286,7 @@ class GithubRepoStatus(StatusBase):
         if not github_repo:
             logger.error("Failed to initialized the repo: %s" % self.repo)
             self.add_result("   Result: Fail (Failed to init github repo)")
+            self.verdict = Verdict.ERROR
             return -1
 
         # Get the number of PR
@@ -333,7 +350,8 @@ def collect_results(task_list):
     results = ""
 
     for task in task_list:
-        results = results + '\n' + task.get_result()
+        if task.verdict != Verdict.PASS:
+            results = results + '\n' + task.get_result()
     return results
 
 def ci_status(args):
